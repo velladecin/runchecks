@@ -1,0 +1,221 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use EV;
+use Readonly;
+use Data::Dumper;
+use Log::Dispatch;
+use Log::Dispatch::File;
+use FindBin;
+use lib $FindBin::Bin . '/lib';
+use utils;
+
+Readonly my $LOG_FILE => '/var/log/runchecks.log';
+Readonly my $MODS_DIR => '/root/comms/checks';
+my @EVENTS;
+my $LOG;
+
+#
+# Main
+
+my ($SINGLE, $BACKGROUND, $DEBUG) =
+    _process_args(@ARGV);
+
+if ($SINGLE) {
+    for my $mod (_get_mods_defs()) {
+        my $conf = $mod->{conf};
+        my $exec = $mod->{exec};
+
+        # is this bit of a hack..? :0
+        my ($log, $loglvl, $logmsg, $cmd) = $exec->($conf->{exec});
+        print "$logmsg\n";
+    }
+
+    exit 0;
+}
+
+$LOG = load_logger();
+if ($BACKGROUND) {
+    load_events();
+    EV::run();
+}
+
+
+
+
+#
+# Subs
+
+sub load_events {
+    my $reload = shift;
+
+    if ($reload) {
+        _log( ['Stopping all events..'] );
+        _stop_event_watchers();
+    }
+
+    _log( ['Starting all events..'] );
+    @EVENTS = _start_event_watchers();
+
+    1;
+}
+
+sub _process_args {
+    my @argv = @_;
+
+    my $single = my $background = my $debug = 0;
+
+    while (my $a = shift @argv) {
+        ($a eq '-1' || $a eq '--single-run') and do { $single++ };
+        ($a eq '-b' || $a eq '--background') and do { $background++ };
+        ($a eq '-d' || $a eq '--debug')      and do { $debug++ };
+    }
+
+    die "Cannot run foreground & background process at the same time"
+        if $single && $background;
+
+    return($single, $background, $debug);
+}
+
+sub _get_mods_defs {
+    my $dh;
+    opendir $dh, $MODS_DIR or die $!;
+
+    my @mods;
+    for my $mod_file (readdir $dh) {
+        next if $mod_file =~ /^\./;
+        next if $mod_file =~ /~$/;
+        next if $mod_file eq 'README';
+
+        # source modules here
+        my $mod = eval { do "$MODS_DIR/$mod_file" };
+        if ($@ || ref $mod ne 'HASH') {
+            _log( ["Could not load module '$mod_file': $@"], {lvl=>'critical'} );
+            die $@;
+        }
+        if (
+            (!$mod->{conf}          || ref $mod->{conf} ne 'HASH')          ||
+            (!$mod->{conf}{daemon}  || ref $mod->{conf}{daemon} ne 'HASH')  ||
+            (!$mod->{exec}          || ref $mod->{exec} ne 'CODE')
+        ){
+            _log( ["Invalid module definition for '$mod_file'"], {lvl=>'critical'} );
+            die;
+        }
+
+        # add more compulsory options here
+        # daemon
+        for ( qw(frequency) ) {
+            die "Missing compulsory conf directive '$_' for mod '$mod_file'"
+                unless $mod->{conf}{daemon}{$_};
+        }
+        # exec
+
+        push @mods, $mod;
+        _log( ["Loaded module '$mod_file'"] );
+    }
+
+    return @mods;
+}
+
+sub _start_event_watchers {
+    my @periodic_jobs;
+    for my $mod (_get_mods_defs()) {
+        my $conf = $mod->{conf};
+        my $exec = $mod->{exec};
+
+        # run in debug mode
+        $conf->{exec}{debug} = $DEBUG
+            if $DEBUG;
+
+        # EV callback
+        my $sub = sub {
+            # @return fields:
+            # log (0/1), log level, log msg, command to execute
+            my ($log, $loglvl, $logmsg, $cmd) = $exec->($conf->{exec});
+            _log( [$logmsg], {lvl=>$loglvl} ) if $log;
+
+            qx($cmd) if $cmd;
+
+            1;
+        };
+
+        my $fr = utils::get_time_seconds( $conf->{daemon}{frequency} );
+        my $at = defined( $conf->{daemon}{first_run} ) # can be '0'
+            ? utils::get_time_seconds($conf->{daemon}{first_run})
+            : int( rand $fr );
+
+        push @periodic_jobs,
+            EV::periodic( $at, $fr, 0, $sub );
+    }
+
+    my @signals = (
+        EV::signal( 'HUP',  sub { _log( ['Detected HUP signal event, reloading..'] ); _reload(); } ),
+        EV::signal( 'INT',  sub { _log( ['Detected INT signal event, exiting..'  ] );  _stop(1); } ),
+        EV::signal( 'TERM', sub { _log( ['Detected TERM signal event, exiting..' ] );  _stop(1); } ),
+    );
+
+    # this var is here for
+    # clarity only
+    my @event_watchers = (
+        @periodic_jobs,
+        @signals,
+    );
+
+    return @event_watchers;
+}
+
+sub _stop_event_watchers {
+    # stop
+    $_->stop() for @EVENTS;
+    # destroy
+    @EVENTS = ();
+
+    1;
+}
+
+sub _log {
+    my ($msg, $ref) = @_;
+    my $m = join ' ', @$msg;
+
+    $LOG->log(
+        message => $m,
+        level => lc( $ref->{lvl} || 'info' ),
+        type => 'file',
+    )
+    if $LOG;
+
+    print "$m\n" if $DEBUG && $SINGLE;
+}
+
+sub load_logger {
+    my $log = Log::Dispatch->new( callbacks=>sub{
+            my %log = @_;
+            my $lvl = uc $log{level};
+            my $msg = $log{message};
+            my $now = scalar( localtime time );
+
+            return "[$now][$lvl]  $msg\n";
+        }
+    );
+    $log->add(
+        Log::Dispatch::File->new(
+            name => 'file',
+            filename => $LOG_FILE,
+            min_level => 'info',
+            mode => 'append',
+            buffered => 0,
+        ),
+    );
+
+    $log->log( message=>'Loading logger..', level=>'info', type=>'file' );
+    return $log;
+}
+
+sub _reload { load_events( 1 ); }
+sub _stop {
+    my $exit = shift;
+
+    _stop_event_watchers();
+
+    exit 0 if $exit;
+}
