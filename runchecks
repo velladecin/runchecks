@@ -18,8 +18,22 @@ my $LOG;
 #
 # Main
 
-my ($SINGLE, $BACKGROUND, $DEBUG) =
+my ($SINGLE, $BACKGROUND, $DEBUG, $HELP) =
     _process_args(@ARGV);
+
+if ($HELP) {
+    (my $self = $0) =~ s|^.*/||;
+    print <<"USAGE";
+Usage: $self <option> [ <option> .. ]
+Options:
+    -1|--single-run         run once and exit
+    -b|--background         run as a daemon
+    -d|--debug              force daemon + all modules found to run in debug mode
+    -h|--help               show this helpful message
+USAGE
+
+    exit 0;
+}
 
 if ($SINGLE) {
     for my $mod (_get_mods_defs()) {
@@ -63,23 +77,27 @@ sub load_events {
 sub _process_args {
     my @argv = @_;
 
-    my $single = my $background = my $debug = 0;
+    my $single = my $background = my $debug = my $help = 0;
 
     while (my $a = shift @argv) {
         ($a eq '-1' || $a eq '--single-run') and do { $single++ };
         ($a eq '-b' || $a eq '--background') and do { $background++ };
         ($a eq '-d' || $a eq '--debug')      and do { $debug++ };
+        ($a eq '-h' || $a eq '--help')       and do { $help++ };
     }
 
     die "Cannot run foreground & background process at the same time"
         if $single && $background;
 
-    return($single, $background, $debug);
+    $help++ unless
+        $single || $background || $help;
+
+    return($single, $background, $debug, $help);
 }
 
 sub _get_mods_defs {
     my $dh;
-    opendir $dh, $MODS_DIR or die $!;
+    opendir $dh, $MODS_DIR or die "Cannot process checks: $!";
 
     my @mods;
     for my $mod_file (readdir $dh) {

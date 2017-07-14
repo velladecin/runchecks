@@ -4,12 +4,71 @@ use warnings;
 use Net::Telnet;
 use Net::Ping;
 use Readonly;
+use FindBin;
+use lib $FindBin::Bin . '/lib';
+use vars qw|$IFACE $PING_TIMEOUT $WAN_PING_TARGET|;
 
-# TODO config file?
-Readonly my $IFACE => 'wlp58s0';
-Readonly my $PING_TIMEOUT => 5;
-Readonly my $ROUTER => '10.0.0.138';
-Readonly my $GOOGLEDNS => '8.8.8.8';
+BEGIN {
+    # parse config
+    my $conf = $FindBin::Bin . '/conf/runchecks.conf';
+    return unless -f $conf;
+
+    open F, '<', $conf or die $!;
+    my @cont = <F>;
+    chomp @cont;
+    close F;
+
+    # add more config sections here,
+    # and in XXX below
+    my $global = 0;
+
+    for my $line (@cont) {
+        next if $line =~ /^\s*$/;
+        next if $line =~ /^\s*#/;
+
+        # fix up line for easier processing
+        $line =~ s/\s//g;
+        $line = lc $line;
+
+        if ($line eq '[global]') {
+            $global++;
+            next;
+        }
+
+        # XXX future use
+        # if ($line eq '[conf_section]') {
+        #   $global = 0;
+        #   ...
+        # }
+
+        if ($global) {
+            my ($key, $val) = split /=/, $line;
+            $key eq 'interface'         and do { $IFACE = $val };
+            $key eq 'ping_timeout'      and do { $PING_TIMEOUT = $val };
+            $key eq 'wan_ping_target'   and do { $WAN_PING_TARGET = $val };
+        }
+
+        # XXX future use
+        # if ($conf_section) {
+        #   ...
+        # }
+    }
+}
+
+# DEFAULTS (see config file)
+Readonly my %DEFAULTS => (
+    iface => 'eth0',
+    ping_timeout => 5,
+    wan_ping_target => '8.8.8.8',
+);
+
+$IFACE           ||= $DEFAULTS{iface};
+$PING_TIMEOUT    ||= $DEFAULTS{ping_timeout};
+$WAN_PING_TARGET   = valid_ip($WAN_PING_TARGET) ? $WAN_PING_TARGET : $DEFAULTS{wan_ping_target};
+
+
+#
+# Subs
 
 sub read_file {
     my $file = shift;
@@ -106,6 +165,29 @@ sub num_to_month {
     return $months{$num};
 }
 
+sub valid_ip {
+    my $ip = shift;
+    return unless
+        $ip and $ip =~ /^\d{1,3}(\.\d{1,3}){3}$/;
+
+    return 1;
+}
+
+sub get_gw {
+    my @gw_cmd_out = qx(ip route show default dev $IFACE scope global);
+    # NIC is up by now, but routing may not be setup make sure to timeout ping if this is so.
+    # We check gw on every run so this will rectify itself in due time..
+    return '1.0.0.0' unless @gw_cmd_out;
+
+    my ($gw_line) = @gw_cmd_out > 1
+        ? grep /^default/, @gw_cmd_out : $gw_cmd_out[0];
+
+    # default via 10.0.0.138  src 10.0.0.3  metric 322
+    my ($gw) = $gw_line =~ /default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+/;
+
+    return $gw;
+}
+
 sub net_iface_up {
     my $if_file = "/sys/class/net/$IFACE/operstate";
     return unless -f $if_file;     
@@ -117,15 +199,17 @@ sub net_iface_up {
 sub net_lan_up {
     return unless net_iface_up();
 
+    my $local_gw = get_gw();
+
     my $ping = Net::Ping->new('icmp');
-    return unless $ping->ping($ROUTER, $PING_TIMEOUT);
+    return unless $ping->ping($local_gw, $PING_TIMEOUT);
     return 1;
 }
 sub net_wan_up {
     return unless net_lan_up();
 
     my $ping = Net::Ping->new('icmp');
-    return unless $ping->ping($GOOGLEDNS, $PING_TIMEOUT);
+    return unless $ping->ping($WAN_PING_TARGET, $PING_TIMEOUT);
     return 1;
 }
 
