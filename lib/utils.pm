@@ -5,7 +5,6 @@ use Net::Telnet;
 use Net::Ping;
 use Readonly;
 use FindBin;
-use lib $FindBin::Bin . '/lib';
 use vars qw|$IFACE $PING_TIMEOUT $WAN_PING_TARGET|;
 
 BEGIN {
