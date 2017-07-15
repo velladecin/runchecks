@@ -10,10 +10,11 @@ use FindBin;
 use lib $FindBin::Bin . '/lib';
 use utils;
 
-Readonly my $LOG_FILE => '/var/log/runchecks.log';
-Readonly my $MODS_DIR => '/root/comms/checks';
-my @EVENTS;
-my $LOG;
+(my $SELF = $0) =~ s|^.*/||;
+Readonly my $LOG_FILE => "/var/log/${SELF}.log";
+Readonly my $MODS_DIR => $FindBin::Bin . '/checks'; # install should create this
+Readonly my $CONF_DIR => $FindBin::Bin . '/conf';   # ditto
+
 
 #
 # Main
@@ -22,9 +23,8 @@ my ($SINGLE, $BACKGROUND, $DEBUG, $HELP) =
     _process_args(@ARGV);
 
 if ($HELP) {
-    (my $self = $0) =~ s|^.*/||;
     print <<"USAGE";
-Usage: $self <option> [ <option> .. ]
+Usage: $SELF <option> [ <option> .. ]
 Options:
     -1|--single-run         run once and exit
     -b|--background         run as a daemon
@@ -35,6 +35,7 @@ USAGE
     exit 0;
 }
 
+my $LOG;
 if ($SINGLE) {
     for my $mod (_get_mods_defs()) {
         my $conf = $mod->{conf};
@@ -48,9 +49,10 @@ if ($SINGLE) {
     exit 0;
 }
 
-$LOG = load_logger();
+my %EVENT_WATCHERS;
 if ($BACKGROUND) {
-    load_events();
+    $LOG = load_logger();
+    load_event_watchers();
     EV::run();
 }
 
@@ -60,16 +62,16 @@ if ($BACKGROUND) {
 #
 # Subs
 
-sub load_events {
+sub load_event_watchers {
     my $reload = shift;
 
     if ($reload) {
-        _log( ['Stopping all events..'] );
+        _log( ['Stopping all event watchers..'] );
         _stop_event_watchers();
     }
 
-    _log( ['Starting all events..'] );
-    @EVENTS = _start_event_watchers();
+    _log( ['Starting all event watchers..'] );
+    _start_event_watchers();
 
     1;
 }
@@ -96,19 +98,23 @@ sub _process_args {
 }
 
 sub _get_mods_defs {
+    my $watch_files = shift;
+
     my $dh;
     opendir $dh, $MODS_DIR or die "Cannot process checks: $!";
 
     my @mods;
-    for my $mod_file (readdir $dh) {
-        next if $mod_file =~ /^\./;
-        next if $mod_file =~ /~$/;
-        next if $mod_file eq 'README';
+    for my $file (readdir $dh) {
+        next if $file =~ /^\./;
+        next if $file =~ /~$/;
+        next if $file eq 'README';
+
+        my $mod_file = $MODS_DIR .'/'. $file;
 
         # source modules here
-        my $mod = eval { do "$MODS_DIR/$mod_file" };
+        my $mod = eval { do $mod_file };
         if ($@ || ref $mod ne 'HASH') {
-            _log( ["Could not load module '$mod_file': $@"], {lvl=>'critical'} );
+            _log( ["Could not load module '$file': $@"], {lvl=>'critical'} );
             die $@;
         }
         if (
@@ -116,28 +122,40 @@ sub _get_mods_defs {
             (!$mod->{conf}{daemon}  || ref $mod->{conf}{daemon} ne 'HASH')  ||
             (!$mod->{exec}          || ref $mod->{exec} ne 'CODE')
         ){
-            _log( ["Invalid module definition for '$mod_file'"], {lvl=>'critical'} );
+            _log( ["Invalid module definition in '$file'"], {lvl=>'critical'} );
             die;
         }
 
         # add more compulsory options here
         # daemon
         for ( qw(frequency) ) {
-            die "Missing compulsory conf directive '$_' for mod '$mod_file'"
+            die "Missing compulsory conf directive '$_' for mod '$file'"
                 unless $mod->{conf}{daemon}{$_};
         }
         # exec
+        # ...
+
+        if ($watch_files) {
+            $EVENT_WATCHERS{file}{$mod_file} =
+                EV::stat($mod_file, 0, sub {
+                    _log( ["Caught file change: $mod_file"], {lvl=>'warn'} );
+                    # XXX what to do now? :)
+                });
+        }
 
         push @mods, $mod;
-        _log( ["Loaded module '$mod_file'"] );
+        _log( ["Loaded module '$file'"] );
     }
 
+    closedir $dh;
     return @mods;
 }
 
 sub _start_event_watchers {
-    my @periodic_jobs;
-    for my $mod (_get_mods_defs()) {
+    my $watch_check_files = 1;
+
+    my @periodic;
+    for my $mod ( _get_mods_defs($watch_check_files) ) {
         my $conf = $mod->{conf};
         my $exec = $mod->{exec};
 
@@ -162,7 +180,7 @@ sub _start_event_watchers {
             ? utils::get_time_seconds($conf->{daemon}{first_run})
             : int( rand $fr );
 
-        push @periodic_jobs,
+        push @periodic,
             EV::periodic( $at, $fr, 0, $sub );
     }
 
@@ -172,21 +190,25 @@ sub _start_event_watchers {
         EV::signal( 'TERM', sub { _log( ['Detected TERM signal event, exiting..' ] );  _stop(1); } ),
     );
 
-    # this var is here for
-    # clarity only
-    my @event_watchers = (
-        @periodic_jobs,
-        @signals,
-    );
+    $EVENT_WATCHERS{periodic} = [ @periodic ];
+    $EVENT_WATCHERS{signal}   = [ @signals ];
 
-    return @event_watchers;
+    1;
 }
-
 sub _stop_event_watchers {
+    my @events;
+    for my $type (keys %EVENT_WATCHERS) {
+        my @e = $type eq 'file'
+            ? values %{ $EVENT_WATCHERS{$type} }
+            : @{ $EVENT_WATCHERS{$type} };
+
+        push @events, @e;
+    }
+
     # stop
-    $_->stop() for @EVENTS;
+    $_->stop() for @events;
     # destroy
-    @EVENTS = ();
+    %EVENT_WATCHERS = ();
 
     1;
 }
@@ -229,7 +251,7 @@ sub load_logger {
     return $log;
 }
 
-sub _reload { load_events( 1 ); }
+sub _reload { load_event_watchers(1); }
 sub _stop {
     my $exit = shift;
 
